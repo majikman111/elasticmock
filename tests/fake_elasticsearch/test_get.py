@@ -12,18 +12,20 @@ class TestGet(TestElasticmock):
             self.es.get(index=INDEX_NAME, id='1')
 
     def test_should_not_raise_notfounderror_when_nonindexed_id_is_used_and_ignored(self):
-        target_doc = self.es.get(index=INDEX_NAME, id='1', ignore=404)
+        ignore_es = self.es.options(ignore_status=404)
+        target_doc = ignore_es.get(index=INDEX_NAME, id='1')
         self.assertFalse(target_doc.get('found'))
 
     def test_should_not_raise_notfounderror_when_nonindexed_id_is_used_and_ignored_list(self):
-        target_doc = self.es.get(index=INDEX_NAME, id='1', ignore=(401, 404))
+        ignore_es = self.es.options(ignore_status=(401, 404))
+        target_doc = ignore_es.get(index=INDEX_NAME, id='1')
         self.assertFalse(target_doc.get('found'))
 
     def test_should_get_document_with_id(self):
         data = self.es.index(index=INDEX_NAME, doc_type=DOC_TYPE, body=BODY)
 
         document_id = data.get('_id')
-        target_doc = self.es.get(index=INDEX_NAME, id=document_id)
+        target_doc = self.es.get(index=INDEX_NAME, id=document_id).body
 
         expected = {
             '_type': DOC_TYPE,
@@ -40,7 +42,7 @@ class TestGet(TestElasticmock):
         data = self.es.index(index=INDEX_NAME, doc_type=DOC_TYPE, body=BODY)
 
         document_id = data.get('_id')
-        target_doc = self.es.get(index=INDEX_NAME, id=document_id, doc_type=DOC_TYPE)
+        target_doc = self.es.get(index=INDEX_NAME, id=document_id, doc_type=DOC_TYPE).body
 
         expected = {
             '_type': DOC_TYPE,
@@ -57,7 +59,7 @@ class TestGet(TestElasticmock):
         data = self.es.index(index=INDEX_NAME, doc_type=DOC_TYPE, body=BODY)
 
         document_id = data.get('_id')
-        target_doc_source = self.es.get_source(index=INDEX_NAME, doc_type=DOC_TYPE, id=document_id)
+        target_doc_source = self.es.get_source(index=INDEX_NAME, doc_type=DOC_TYPE, id=document_id).body
 
         self.assertEqual(target_doc_source, BODY)
 
@@ -66,5 +68,5 @@ class TestGet(TestElasticmock):
         for _ in range(0, 10):
             data = self.es.index(index=INDEX_NAME, doc_type=DOC_TYPE, body=BODY)
             ids.append(data.get('_id'))
-        results = self.es.mget(index=INDEX_NAME, body={'docs': [{'_id': id} for id in ids]})
+        results = self.es.mget(index=INDEX_NAME, body={'docs': [{'_id': id} for id in ids]}).body
         self.assertEqual(len(results['docs']), 10)

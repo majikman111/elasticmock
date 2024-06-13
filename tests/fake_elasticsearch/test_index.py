@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 
+import unittest
 from tests import TestElasticmock, INDEX_NAME, DOC_TYPE, BODY
+import elasticsearch
 
 UPDATED_BODY = {
     'author': 'vrcmarcos',
@@ -27,6 +29,7 @@ class TestIndex(TestElasticmock):
         self.assertEqual(1, data.get('_version'))
         self.assertEqual(INDEX_NAME, data.get('_index'))
 
+    @unittest.skipIf(elasticsearch.__version__ > (8, 0), "Custom doc-types deprectated in ES 6, not supported in ES 8 or higher.")
     def test_doc_type_can_be_list(self):
         doc_types = ['1_idx', '2_idx', '3_idx']
         count_per_doc_type = 3
@@ -45,7 +48,7 @@ class TestIndex(TestElasticmock):
         data = self.es.index(index=INDEX_NAME, doc_type=DOC_TYPE, body=BODY)
         document_id = data.get('_id')
         self.es.index(index=INDEX_NAME, id=document_id, doc_type=DOC_TYPE, body=UPDATED_BODY)
-        target_doc = self.es.get(index=INDEX_NAME, id=document_id)
+        target_doc = self.es.get(index=INDEX_NAME, id=document_id).body
 
         expected = {
             '_type': DOC_TYPE,

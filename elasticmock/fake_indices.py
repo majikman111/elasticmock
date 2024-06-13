@@ -1,32 +1,83 @@
 # -*- coding: utf-8 -*-
+import typing as t
 
-from elasticsearch.client.indices import IndicesClient
-from elasticsearch.client.utils import query_params
+from elastic_transport import ObjectApiResponse, HeadApiResponse, ApiResponseMeta
+from elasticsearch.exceptions import NotFoundError, BadRequestError
+
+from elasticsearch._sync.client.indices import IndicesClient
+from elasticsearch._sync.client.utils import _rewrite_parameters
+from elasticmock.utilities.decorator import wrap_object_api_response
 
 
 class FakeIndicesClient(IndicesClient):
 
-    @query_params('master_timeout', 'timeout')
-    def create(self, index, body=None, params=None, headers=None, *args, **kwargs):
-        documents_dict = self.__get_documents_dict()
+    @_rewrite_parameters(
+        body_fields=("aliases", "mappings", "settings"),
+    )
+    @wrap_object_api_response
+    def create(
+        self,
+        *,
+        index: str,
+        body: t.Optional[t.Dict[str, t.Any]] = None,
+        **params
+    ) -> ObjectApiResponse[t.Any]:
+        documents_dict = self._get_documents_dict()
         if index not in documents_dict:
             documents_dict[index] = []
+            return {
+                "acknowledged": True,
+                "shards_acknowledged": True,
+                "index": index,
+            }
+        else:
+            raise BadRequestError(message='resource_already_exists_exception', meta=ApiResponseMeta(400, "HTTP/1.1", {}, 1, None), body={"type": "resource_already_exists_exception"})
 
-    @query_params('allow_no_indices', 'expand_wildcards', 'ignore_unavailable',
-                  'local')
-    def exists(self, index, params=None, headers=None):
-        return index in self.__get_documents_dict()
+    @_rewrite_parameters(
+        body_fields=("aliases", "mappings", "settings"),
+    )
+    def exists(
+        self,
+        *,
+        index: str,
+        body: t.Optional[t.Dict[str, t.Any]] = None,
+        **params
+    ) -> HeadApiResponse:
+        status = 200 if index in self._get_documents_dict() else 404
+        return HeadApiResponse(
+            meta=ApiResponseMeta(status, "HTTP/1.1", {}, 1, None),
+        )
 
-    @query_params('allow_no_indices', 'expand_wildcards', 'force',
-                  'ignore_unavailable', 'operation_threading')
-    def refresh(self, index=None, params=None, headers=None):
-        pass
+    @_rewrite_parameters()
+    def refresh(
+        self,
+        index: t.Optional[t.Union[str, t.Sequence[str]]] = None,
+        **params
+    ) -> ObjectApiResponse[t.Any]:
+        if self.exists(index=index):
+            return {
+                "_shards": {
+                    "total": 1,
+                    "successful": 1,
+                    "failed": 0
+                }
+            }
+        else:
+            raise NotFoundError(message=f"no such index [{index}]", meta=ApiResponseMeta(404, "HTTP/1.1", {}, 1, None), body={"type": "index_not_found_exception"})
 
-    @query_params('master_timeout', 'timeout')
-    def delete(self, index, params=None, headers=None):
-        documents_dict = self.__get_documents_dict()
+    @_rewrite_parameters()
+    def delete(
+        self,
+        *,
+        index: t.Union[str, t.Sequence[str]],
+        **params
+    ) -> ObjectApiResponse[t.Any]:
+        documents_dict = self._get_documents_dict()
         if index in documents_dict:
             del documents_dict[index]
+            return {"acknowledged": True}
+        else:
+            raise NotFoundError(message=f"no such index [{index}]", meta=ApiResponseMeta(404, "HTTP/1.1", {}, 1, None), body={"type": "index_not_found_exception"})
 
-    def __get_documents_dict(self):
-        return self.client._FakeElasticsearch__documents_dict
+    def _get_documents_dict(self):
+        return self._client._documents_dict

@@ -2,7 +2,7 @@
 
 from functools import wraps
 
-from elasticsearch.client import _normalize_hosts
+from elasticsearch._sync.client.utils import client_node_configs
 from unittest.mock import patch
 
 from elasticmock.fake_elasticsearch import FakeElasticsearch
@@ -11,15 +11,15 @@ ELASTIC_INSTANCES = {}
 
 
 def _get_elasticmock(hosts=None, *args, **kwargs):
-    host = _normalize_hosts(hosts)[0]
+    host = client_node_configs(hosts, cloud_id=None)[0]
     elastic_key = '{0}:{1}'.format(
-        host.get('host', 'localhost'), host.get('port', 9200)
+        host.host, host.port
     )
 
     if elastic_key in ELASTIC_INSTANCES:
         connection = ELASTIC_INSTANCES.get(elastic_key)
     else:
-        connection = FakeElasticsearch()
+        connection = FakeElasticsearch(hosts=[host])
         ELASTIC_INSTANCES[elastic_key] = connection
     return connection
 

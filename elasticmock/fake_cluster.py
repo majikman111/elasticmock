@@ -1,15 +1,21 @@
 # -*- coding: utf-8 -*-
+import typing as t
+from elasticsearch._sync.client.cluster import ClusterClient
+from elasticsearch._sync.client.utils import _rewrite_parameters
 
-from elasticsearch.client.cluster import ClusterClient
-from elasticsearch.client.utils import query_params
+
+from elastic_transport import ObjectApiResponse
+from elasticmock.utilities.decorator import wrap_object_api_response
 
 
 class FakeClusterClient(ClusterClient):
 
-    @query_params('level', 'local', 'master_timeout', 'timeout',
-                  'wait_for_active_shards', 'wait_for_nodes',
-                  'wait_for_relocating_shards', 'wait_for_status')
-    def health(self, index=None, params=None, headers=None):
+    @_rewrite_parameters()
+    @wrap_object_api_response
+    def health(
+        self,
+        **params
+    ) -> ObjectApiResponse[t.Any]:
         return {
             'cluster_name': 'testcluster',
             'status': 'green',

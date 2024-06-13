@@ -8,7 +8,7 @@ import elasticsearch
 from elasticmock import elasticmock
 
 INDEX_NAME = 'test_index'
-DOC_TYPE = 'doc-Type'
+DOC_TYPE = '_doc'
 DOC_ID = 'doc-id'
 BODY = {
     'author': 'kimchy',
@@ -21,4 +21,4 @@ class TestElasticmock(unittest.TestCase):
 
     @elasticmock
     def setUp(self):
-        self.es = elasticsearch.Elasticsearch(hosts=[{'host': 'localhost', 'port': 9200}])
+        self.es = elasticsearch.Elasticsearch(hosts=[{'host': 'localhost', 'port': 9200, 'scheme': 'http'}])

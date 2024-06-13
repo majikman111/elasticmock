@@ -14,6 +14,6 @@ class TestInstance(TestElasticmock):
 
     @elasticmock
     def test_should_return_same_elastic_instance_when_instantiate_more_than_one_instance_with_same_host(self):
-        es1 = elasticsearch.Elasticsearch(hosts=[{'host': 'localhost', 'port': 9200}])
-        es2 = elasticsearch.Elasticsearch(hosts=[{'host': 'localhost', 'port': 9200}])
+        es1 = elasticsearch.Elasticsearch(hosts=[{'host': 'localhost', 'port': 9200, 'scheme': 'http'}])
+        es2 = elasticsearch.Elasticsearch(hosts=[{'host': 'localhost', 'port': 9200, 'scheme': 'http'}])
         self.assertEqual(es1, es2)

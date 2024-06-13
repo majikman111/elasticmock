@@ -2,7 +2,7 @@
 
 import setuptools
 
-__version__ = '1.8.1'
+__version__ = '2.0.0'
 
 # read the contents of your readme file
 from os import path
@@ -21,7 +21,7 @@ setuptools.setup(
     url='https://github.com/vrcmarcos/elasticmock',
     packages=setuptools.find_packages(exclude=('tests')),
     install_requires=[
-        'elasticsearch<8.0.0',
+        'elasticsearch>=8.0.0,<9.0.0',
         'python-dateutil',
     ],
     classifiers=[
@@ -34,6 +34,9 @@ setuptools.setup(
         'Programming Language :: Python :: 3.7',
         'Programming Language :: Python :: 3.8',
         'Programming Language :: Python :: 3.9',
+        'Programming Language :: Python :: 3.10',
+        'Programming Language :: Python :: 3.11',
+        'Programming Language :: Python :: 3.12',
         "License :: OSI Approved :: MIT License",
         'Topic :: Software Development :: Libraries :: Python Modules'
     ]

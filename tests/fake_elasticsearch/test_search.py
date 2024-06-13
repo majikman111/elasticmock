@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 import datetime
+import unittest
 
+import elasticsearch
 from elasticsearch.exceptions import NotFoundError
 from parameterized import parameterized
 
@@ -46,6 +48,7 @@ class TestSearch(TestElasticmock):
         search = self.es.search(index=INDEX_NAME)
         self.assertEqual(index_quantity, search.get('hits').get('total').get('value'))
 
+    @unittest.skipIf(elasticsearch.__version__ > (8, 0), "Custom doc-types deprectated in ES 6, not supported in ES 8 or higher.")
     def test_should_return_only_indexed_documents_on_index_with_doc_type(self):
         index_quantity = 2
         for i in range(0, index_quantity):
@@ -75,7 +78,7 @@ class TestSearch(TestElasticmock):
         for _ in range(100):
             self.es.index(index='groups', doc_type='groups', body={'budget': 1000})
 
-        result = self.es.search(index='groups', params={'scroll': '1m', 'size': 30})
+        result = self.es.search(index='groups', **{'scroll': '1m', 'size': 30})
         self.assertNotEqual(None, result.get('_scroll_id', None))
         self.assertEqual(30, len(result.get('hits').get('hits')))
         self.assertEqual(100, result.get('hits').get('total').get('value'))
@@ -165,7 +168,7 @@ class TestSearch(TestElasticmock):
 
     def test_query_on_nested_data(self):
         for i, y in enumerate(['yes', 'no']):
-            self.es.index('index_for_search', doc_type=DOC_TYPE,
+            self.es.index(index='index_for_search', doc_type=DOC_TYPE,
                           body={'id': i, 'data': {'x': i, 'y': y}})
 
         for term, value, i in [('data.x', 1, 1), ('data.y', 'yes', 0)]:

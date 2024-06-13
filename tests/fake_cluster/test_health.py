@@ -6,7 +6,7 @@ from tests import TestElasticmock
 class TestHealth(TestElasticmock):
 
     def test_should_return_health(self):
-        health_status = self.es.cluster.health()
+        health_status = self.es.cluster.health().body
 
         expected_health_status = {
             'cluster_name': 'testcluster',

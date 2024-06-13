@@ -1,22 +1,34 @@
 # -*- coding: utf-8 -*-
+import re
 import datetime
 import json
 import sys
+import typing as t
+import functools
 from collections import defaultdict
 
 import dateutil.parser
 from elasticsearch import Elasticsearch
-from elasticsearch.client.utils import query_params
-from elasticsearch.client import _normalize_hosts
-from elasticsearch.transport import Transport
-from elasticsearch.exceptions import NotFoundError, RequestError
+from elasticsearch._sync.client._base import BaseClient
+from elasticsearch._sync.client.utils import _rewrite_parameters
+from elasticsearch._sync.client.utils import client_node_configs
+from elastic_transport import (
+    ApiResponseMeta,
+    HeadApiResponse,
+    ObjectApiResponse,
+    Transport,
+)
+from elastic_transport.client_utils import DEFAULT, DefaultType
+from elasticsearch.exceptions import NotFoundError, BadRequestError
 
 from elasticmock.behaviour.server_failure import server_failure
 from elasticmock.fake_cluster import FakeClusterClient
 from elasticmock.fake_indices import FakeIndicesClient
-from elasticmock.utilities import (extract_ignore_as_iterable, get_random_id,
-    get_random_scroll_id)
-from elasticmock.utilities.decorator import for_all_methods
+from elasticmock.utilities import get_random_id, get_random_scroll_id
+from elasticmock.utilities.decorator import for_all_methods, wrap_object_api_response
+
+
+SelfType = t.TypeVar("SelfType", bound="FakeElasticsearch")
 
 PY3 = sys.version_info[0] == 3
 if PY3:
@@ -285,14 +297,21 @@ class FakeQueryCondition:
         return False
 
 
+class NoOpTransport(Transport):
+    def perform_request(self, *args, **kwargs):
+        assert False, "Transport should not be invoked during unit tests."
+
+
 @for_all_methods([server_failure])
 class FakeElasticsearch(Elasticsearch):
-    __documents_dict = None
+    _documents_dict = None
 
-    def __init__(self, hosts=None, transport_class=None, **kwargs):
-        self.__documents_dict = {}
-        self.__scrolls = {}
-        self.transport = Transport(_normalize_hosts(hosts), **kwargs)
+    def __init__(self, hosts=None, *, transport_class=None, _transport=None, **kwargs):
+        self._documents_dict = {}
+        self._scrolls = {}
+        if _transport is None:
+            _transport = NoOpTransport(hosts, **kwargs)
+        BaseClient.__init__(self, _transport)
 
     @property
     def indices(self):
@@ -302,58 +321,76 @@ class FakeElasticsearch(Elasticsearch):
     def cluster(self):
         return FakeClusterClient(self)
 
-    @query_params()
-    def ping(self, params=None, headers=None):
+    def options(
+        self: SelfType,
+        ignore_status: t.Union[DefaultType, int, t.Collection[int]] = DEFAULT,
+        **params
+    ) -> SelfType:
+        if ignore_status is not DEFAULT:
+            if isinstance(ignore_status, int):
+                ignore_status = (ignore_status,)
+            self._ignore_status = ignore_status
+        return self
+
+    @_rewrite_parameters()
+    def ping(self, **kwargs) -> bool:
         return True
 
-    @query_params()
-    def info(self, params=None, headers=None):
+    @_rewrite_parameters()
+    @wrap_object_api_response
+    def info(self, **kwargs) -> ObjectApiResponse[t.Any]:
         return {
             'status': 200,
             'cluster_name': 'elasticmock',
             'version':
                 {
-                    'lucene_version': '4.10.4',
-                    'build_hash': '00f95f4ffca6de89d68b7ccaf80d148f1f70e4d4',
-                    'number': '1.7.5',
-                    'build_timestamp': '2016-02-02T09:55:30Z',
-                    'build_snapshot': False
+                    "number" : "8.12.0",
+                    "build_flavor" : "default",
+                    "build_type" : "tar",
+                    "build_hash" : "1665f706fd9354802c02146c1e6b5c0fbcddfbc9",
+                    "build_date" : "2024-01-11T10:05:27.953830042Z",
+                    "build_snapshot" : False,
+                    "lucene_version" : "9.9.1",
+                    "minimum_wire_compatibility_version" : "7.17.0",
+                    "minimum_index_compatibility_version" : "7.0.0"
                 },
             'name': 'Nightwatch',
             'tagline': 'You Know, for Search'
         }
 
-    @query_params('consistency',
-                  'op_type',
-                  'parent',
-                  'refresh',
-                  'replication',
-                  'routing',
-                  'timeout',
-                  'timestamp',
-                  'ttl',
-                  'version',
-                  'version_type')
-    def index(self, index, body, doc_type='_doc', id=None, params=None, headers=None):
-        if index not in self.__documents_dict:
-            self.__documents_dict[index] = list()
+    @_rewrite_parameters(
+        body_name="document",
+    )
+    @wrap_object_api_response
+    def index(
+        self,
+        *,
+        index: str,
+        document: t.Optional[t.Mapping[str, t.Any]] = None,
+        body: t.Optional[t.Mapping[str, t.Any]] = None,
+        id: t.Optional[str] = None,
+        **params
+    ) -> ObjectApiResponse[t.Any]:
+        if index not in self._documents_dict:
+            self._documents_dict[index] = list()
 
         version = 1
+        doc_type = "_doc"
 
         result = 'created'
         if id is None:
             id = get_random_id()
 
-        elif self.exists(index, id, doc_type=doc_type, params=params):
-            doc = self.get(index, id, doc_type=doc_type, params=params)
+        elif self.exists(index=index, id=id, **params):
+            doc = self.get(index=index, id=id, **params)
             version = doc['_version'] + 1
-            self.delete(index, id, doc_type=doc_type)
+            self.delete(index=index, id=id)
             result = 'updated'
 
-        self.__documents_dict[index].append({
+        self._documents_dict[index].append({
             '_type': doc_type,
             '_id': id,
-            '_source': body,
+            '_source': document,
             '_index': index,
             '_version': version
         })
@@ -367,187 +404,195 @@ class FakeElasticsearch(Elasticsearch):
             'result': result
         }
 
-    @query_params('consistency', 'op_type', 'parent', 'refresh', 'replication',
-                  'routing', 'timeout', 'timestamp', 'ttl', 'version', 'version_type')
-    def bulk(self, body, index=None, doc_type=None, params=None, headers=None):
+    @_rewrite_parameters(
+        body_name="operations",
+        parameter_aliases={
+            "_source": "source",
+            "_source_excludes": "source_excludes",
+            "_source_includes": "source_includes",
+        },
+    )
+    def bulk(
+        self,
+        *,
+        operations: t.Optional[t.Sequence[t.Mapping[str, t.Any]]] = None,
+        body: t.Optional[t.Sequence[t.Mapping[str, t.Any]]] = None,
+        index: t.Optional[str] = None,
+        **params
+    ) -> ObjectApiResponse[t.Any]:
         items = []
         errors = False
 
-        for raw_line in body.splitlines():
-            if len(raw_line.strip()) > 0:
-                line = json.loads(raw_line)
+        if isinstance(operations, str):
+            operations = [json.loads(raw_line.strip()) for raw_line in operations.splitlines() if raw_line.strip()]
 
-                if any(action in line for action in ['index', 'create', 'update', 'delete']):
-                    action = next(iter(line.keys()))
+        for line in operations:
+            if any(action in line for action in ['index', 'create', 'update', 'delete']):
+                action = next(iter(line.keys()))
 
-                    version = 1
-                    index = line[action].get('_index') or index
-                    doc_type = line[action].get('_type', "_doc")  # _type is deprecated in 7.x
+                version = 1
+                index = line[action].get('_index') or index
 
-                    if action in ['delete', 'update'] and not line[action].get("_id"):
-                        raise RequestError(400, 'action_request_validation_exception', 'missing id')
+                if action in ['delete', 'update'] and not line[action].get("_id"):
+                    raise BadRequestError(message='action_request_validation_exception, missing id', meta=ApiResponseMeta(400, "HTTP/1.1", {}, 1, None), body=operations)
 
-                    document_id = line[action].get('_id', get_random_id())
+                document_id = line[action].get('_id', get_random_id())
 
-                    if action == 'delete':
-                        status, result, error = self._validate_action(
-                            action, index, document_id, doc_type, params=params
-                        )
-                        item = {action: {
-                            '_type': doc_type,
-                            '_id': document_id,
-                            '_index': index,
-                            '_version': version,
-                            'status': status,
-                        }}
-                        if error:
-                            errors = True
-                            item[action]["error"] = result
-                        else:
-                            self.delete(index, document_id, doc_type=doc_type, params=params)
-                            item[action]["result"] = result
-                        items.append(item)
-
-                    if index not in self.__documents_dict:
-                        self.__documents_dict[index] = list()
-                else:
-                    if 'doc' in line and action == 'update':
-                        source = line['doc']
-                    else:
-                        source = line
+                if action == 'delete':
                     status, result, error = self._validate_action(
-                        action, index, document_id, doc_type, params=params
+                        action, index, document_id, **params
                     )
-                    item = {
-                        action: {
-                            '_type': doc_type,
-                            '_id': document_id,
-                            '_index': index,
-                            '_version': version,
-                            'status': status,
-                        }
-                    }
-                    if not error:
-                        item[action]["result"] = result
-                        if self.exists(index, document_id, doc_type=doc_type, params=params):
-                            doc = self.get(index, document_id, doc_type=doc_type, params=params)
-                            version = doc['_version'] + 1
-                            self.delete(index, document_id, doc_type=doc_type, params=params)
-
-                        self.__documents_dict[index].append({
-                            '_type': doc_type,
-                            '_id': document_id,
-                            '_source': source,
-                            '_index': index,
-                            '_version': version
-                        })
-                    else:
+                    item = {action: {
+                        '_type': "_doc",
+                        '_id': document_id,
+                        '_index': index,
+                        '_version': version,
+                        'status': status,
+                    }}
+                    if error:
                         errors = True
                         item[action]["error"] = result
+                    else:
+                        self.delete(index=index, id=document_id, **params)
+                        item[action]["result"] = result
                     items.append(item)
-        return {
-            'errors': errors,
-            'items': items
-        }
 
-    def _validate_action(self, action, index, document_id, doc_type, params=None):
-        if action in ['index', 'update'] and self.exists(index, id=document_id, doc_type=doc_type, params=params):
+                if index not in self._documents_dict:
+                    self._documents_dict[index] = list()
+            else:
+                if 'doc' in line and action == 'update':
+                    source = line['doc']
+                else:
+                    source = line
+                status, result, error = self._validate_action(
+                    action, index, document_id, **params
+                )
+                item = {
+                    action: {
+                        '_type': "_doc",
+                        '_id': document_id,
+                        '_index': index,
+                        '_version': version,
+                        'status': status,
+                    }
+                }
+                if not error:
+                    item[action]["result"] = result
+                    if self.exists(index=index, id=document_id, **params):
+                        doc = self.get(index=index, id=document_id, **params)
+                        version = doc['_version'] + 1
+                        self.delete(index=index, id=document_id, **params)
+
+                    self._documents_dict[index].append({
+                        '_type': "_doc",
+                        '_id': document_id,
+                        '_source': source,
+                        '_index': index,
+                        '_version': version
+                    })
+                else:
+                    errors = True
+                    item[action]["error"] = result
+                items.append(item)
+        return ObjectApiResponse(
+            body={
+                'errors': errors,
+                'items': items
+            },
+            meta=ApiResponseMeta(status, "HTTP/1.1", {}, 1, None),
+        )
+
+    def _validate_action(self, action, index, document_id, **params):
+        if action in ['index', 'update'] and self.exists(index=index, id=document_id, **params):
             return 200, 'updated', False
-        if action == 'create' and self.exists(index, id=document_id, doc_type=doc_type, params=params):
+        if action == 'create' and self.exists(index=index, id=document_id, **params):
             return 409, 'version_conflict_engine_exception', True
-        elif action in ['index', 'create'] and not self.exists(index, id=document_id, doc_type=doc_type, params=params):
+        elif action in ['index', 'create'] and not self.exists(index=index, id=document_id, **params):
             return 201, 'created', False
-        elif action == "delete" and self.exists(index, id=document_id, doc_type=doc_type, params=params):
+        elif action == "delete" and self.exists(index=index, id=document_id, **params):
             return 200, 'deleted', False
-        elif action == 'update' and not self.exists(index, id=document_id, doc_type=doc_type, params=params):
+        elif action == 'update' and not self.exists(index=index, id=document_id, **params):
             return 404, 'document_missing_exception', True
-        elif action == 'delete' and not self.exists(index, id=document_id, doc_type=doc_type, params=params):
+        elif action == 'delete' and not self.exists(index=index, id=document_id, **params):
             return 404, 'not_found', True
         else:
             raise NotImplementedError(f"{action} behaviour hasn't been implemented")
 
-    @query_params('parent', 'preference', 'realtime', 'refresh', 'routing')
-    def exists(self, index, id, doc_type=None, params=None, headers=None):
-        result = False
-        if index in self.__documents_dict:
-            for document in self.__documents_dict[index]:
-                if document.get('_id') == id and document.get('_type') == doc_type:
-                    result = True
+    @_rewrite_parameters(
+        parameter_aliases={
+            "_source": "source",
+            "_source_excludes": "source_excludes",
+            "_source_includes": "source_includes",
+        },
+    )
+    def exists(
+        self,
+        *,
+        index: str,
+        id: str,
+        **params,
+    ) -> HeadApiResponse:
+        status = 404
+        if index in self._documents_dict:
+            for document in self._documents_dict[index]:
+                if document.get('_id') == id:
+                    status = 200
                     break
-        return result
 
-    @query_params('_source', '_source_exclude', '_source_include', 'fields',
-                  'parent', 'preference', 'realtime', 'refresh', 'routing', 'version',
-                  'version_type')
-    def get(self, index, id, doc_type='_all', params=None, headers=None):
-        ignore = extract_ignore_as_iterable(params)
+        return HeadApiResponse(
+            meta=ApiResponseMeta(status, "HTTP/1.1", {}, 1, None),
+        )
+
+    @_rewrite_parameters(
+        parameter_aliases={
+            "_source": "source",
+            "_source_excludes": "source_excludes",
+            "_source_includes": "source_includes",
+        },
+    )
+    @wrap_object_api_response
+    def get(
+        self,
+        *,
+        index: str,
+        id: str,
+        **params,
+    ) -> ObjectApiResponse[t.Any]:
         result = None
 
-        if index in self.__documents_dict:
-            for document in self.__documents_dict[index]:
+        if index in self._documents_dict:
+            for document in self._documents_dict[index]:
                 if document.get('_id') == id:
-                    if doc_type == '_all':
-                        result = document
-                        break
-                    else:
-                        if document.get('_type') == doc_type:
-                            result = document
-                            break
+                    result = document
+                    break
 
         if result:
             result['found'] = True
             return result
-        elif params and 404 in ignore:
+        elif self._ignore_status is not DEFAULT and 404 in self._ignore_status:
             return {'found': False}
         else:
             error_data = {
                 '_index': index,
-                '_type': doc_type,
+                '_type': "_doc",
                 '_id': id,
                 'found': False
             }
-            raise NotFoundError(404, json.dumps(error_data))
+            raise NotFoundError(message="Not Found", meta=ApiResponseMeta(404, "HTTP/1.1", {}, 1, None), body=error_data)
 
-    @query_params(
-        "_source",
-        "_source_excludes",
-        "_source_includes",
-        "allow_no_indices",
-        "analyze_wildcard",
-        "analyzer",
-        "conflicts",
-        "default_operator",
-        "df",
-        "expand_wildcards",
-        "from_",
-        "ignore_unavailable",
-        "lenient",
-        "max_docs",
-        "pipeline",
-        "preference",
-        "q",
-        "refresh",
-        "request_cache",
-        "requests_per_second",
-        "routing",
-        "scroll",
-        "scroll_size",
-        "search_timeout",
-        "search_type",
-        "size",
-        "slices",
-        "sort",
-        "stats",
-        "terminate_after",
-        "timeout",
-        "version",
-        "version_type",
-        "wait_for_active_shards",
-        "wait_for_completion",
+    @_rewrite_parameters(
+        body_fields=("conflicts", "max_docs", "query", "script", "slice"),
+        parameter_aliases={"from": "from_"},
     )
+    @wrap_object_api_response
     def update_by_query(
-        self, index, body=None, doc_type=None, params=None, headers=None
-    ):
+        self,
+        *,
+        index: t.Union[str, t.Sequence[str]],
+        script: t.Optional[t.Mapping[str, t.Any]] = None,
+        body: t.Optional[t.Dict[str, t.Any]] = None,
+        **params
+    ) -> ObjectApiResponse[t.Any]:
         # Actually it only supports script equal operations
         # TODO: Full support from painless language
         total_updated = 0
@@ -556,23 +601,22 @@ class FakeElasticsearch(Elasticsearch):
         new_values = {}
         script_params = body['script']['params']
         script_source = body['script']['source'] \
-            .replace('ctx._source.', '') \
             .split(';')
         for sentence in script_source:
             if sentence:
-                field, _, value = sentence.split()
-                if value.startswith('params.'):
-                    _, key = value.split('.')
+                mtch = re.match(r"\s*ctx._source.(?P<field>\w+)\s*=\s*\(?params.(?P<key>\w+)\)?\s*", sentence)
+                if mtch:
+                    field = mtch.group("field")
+                    key = mtch.group("key")
                     value = script_params.get(key)
                 new_values[field] = value
 
-        matches = self.search(index=index, doc_type=doc_type, body=body,
-            params=params, headers=headers)
+        matches = self.search(index=index, body=body, **params)
         if matches['hits']['total']:
             for hit in matches['hits']['hits']:
                 body = hit['_source']
                 body.update(new_values)
-                self.index(index, body, doc_type=hit['_type'], id=hit['_id'])
+                self.index(index=index, body=body, doc_type=hit['_type'], id=hit['_id'])
                 total_updated += 1
 
         return {
@@ -591,51 +635,94 @@ class FakeElasticsearch(Elasticsearch):
             'failures': []
         }
 
-
-    @query_params('_source', '_source_exclude', '_source_include',
-                  'preference', 'realtime', 'refresh', 'routing',
-                  'stored_fields')
-    def mget(self, body, index, doc_type='_all', params=None, headers=None):
-        docs = body.get('docs')
+    @_rewrite_parameters(
+        body_fields=("docs", "ids"),
+        parameter_aliases={
+            "_source": "source",
+            "_source_excludes": "source_excludes",
+            "_source_includes": "source_includes",
+        },
+    )
+    @wrap_object_api_response
+    def mget(
+        self,
+        *,
+        index: t.Optional[str] = None,
+        docs: t.Optional[t.Sequence[t.Mapping[str, t.Any]]] = None,
+        body: t.Optional[t.Dict[str, t.Any]] = None,
+        **params
+    ) -> ObjectApiResponse[t.Any]:
+        docs = body.get('docs') or docs
         ids = [doc['_id'] for doc in docs]
         results = []
         for id in ids:
             try:
-                results.append(self.get(index, id, doc_type=doc_type,
-                    params=params, headers=headers))
+                results.append(self.get(index=index, id=id, **params))
             except:
                 pass
         if not results:
-            raise RequestError(
-                400,
-                'action_request_validation_exception',
-                'Validation Failed: 1: no documents to get;'
-            )
+            raise BadRequestError(message='action_request_validation_exception; Validation Failed: 1: no documents to get;', meta=ApiResponseMeta(400, "HTTP/1.1", {}, 1, None), body=body)
         return {'docs': results}
 
-    @query_params('_source', '_source_exclude', '_source_include', 'parent',
-                  'preference', 'realtime', 'refresh', 'routing', 'version',
-                  'version_type')
-    def get_source(self, index, doc_type, id, params=None, headers=None):
-        document = self.get(index=index, doc_type=doc_type, id=id, params=params)
+    @_rewrite_parameters(
+        parameter_aliases={
+            "_source": "source",
+            "_source_excludes": "source_excludes",
+            "_source_includes": "source_includes",
+        },
+    )
+    @wrap_object_api_response
+    def get_source(
+        self,
+        *,
+        index: str,
+        id: str,
+        **params
+    ) -> ObjectApiResponse[t.Any]:
+        document = self.get(index=index, id=id, **params)
         return document.get('_source')
 
-    @query_params('_source', '_source_exclude', '_source_include',
-                  'allow_no_indices', 'analyze_wildcard', 'analyzer', 'default_operator',
-                  'df', 'expand_wildcards', 'explain', 'fielddata_fields', 'fields',
-                  'from_', 'ignore_unavailable', 'lenient', 'lowercase_expanded_terms',
-                  'preference', 'q', 'request_cache', 'routing', 'scroll', 'search_type',
-                  'size', 'sort', 'stats', 'suggest_field', 'suggest_mode',
-                  'suggest_size', 'suggest_text', 'terminate_after', 'timeout',
-                  'track_scores', 'version')
-    def count(self, index=None, doc_type=None, body=None, params=None, headers=None):
+    @_rewrite_parameters(
+        body_fields=("scroll_id",),
+    )
+    @wrap_object_api_response
+    def clear_scroll(
+        self,
+        *,
+        scroll_id: t.Optional[t.Union[str, t.Sequence[str]]] = None,
+        body: t.Optional[t.Dict[str, t.Any]] = None,
+    ) -> ObjectApiResponse[t.Any]:
+        succeeded = True
+        num_freed = 1
+        if scroll_id == "_all":
+            num_freed = (len(self._scrolls))
+            self._scrolls.clear()
+        elif scroll_id in self._scrolls:
+            del self._scrolls[scroll_id]
+        else:
+            succeeded = True
+            num_freed = 0
+
+        return {
+            "succeeded": succeeded,
+            "num_freed": num_freed,
+        }
+
+    @_rewrite_parameters(
+        body_fields=("query",),
+    )
+    @wrap_object_api_response
+    def count(
+        self,
+        *,
+        index: t.Optional[t.Union[str, t.Sequence[str]]] = None,
+        **params
+    ) -> ObjectApiResponse[t.Any]:
         searchable_indexes = self._normalize_index_to_list(index)
 
         i = 0
         for searchable_index in searchable_indexes:
-            for document in self.__documents_dict[searchable_index]:
-                if doc_type and document.get('_type') != doc_type:
-                    continue
+            for document in self._documents_dict[searchable_index]:
                 i += 1
         result = {
             'count': i,
@@ -652,16 +739,17 @@ class FakeElasticsearch(Elasticsearch):
     def _get_fake_query_condition(self, query_type_str, condition):
         return FakeQueryCondition(QueryType.get_query_type(query_type_str), condition)
 
-    @query_params(
-        "ccs_minimize_roundtrips",
-        "max_concurrent_searches",
-        "max_concurrent_shard_requests",
-        "pre_filter_shard_size",
-        "rest_total_hits_as_int",
-        "search_type",
-        "typed_keys",
+    @_rewrite_parameters(
+        body_name="searches",
     )
-    def msearch(self, body, index=None, doc_type=None, params=None, headers=None):
+    @wrap_object_api_response
+    def msearch(
+        self,
+        *,
+        searches: t.Optional[t.Sequence[t.Mapping[str, t.Any]]] = None,
+        body: t.Optional[t.Sequence[t.Mapping[str, t.Any]]] = None,
+        **params
+    ) -> ObjectApiResponse[t.Any]:
         def grouped(iterable):
             if len(iterable) % 2 != 0:
                 raise Exception('Malformed body')
@@ -674,7 +762,7 @@ class FakeElasticsearch(Elasticsearch):
 
         responses = []
         took = 0
-        for ind, query in grouped(body):
+        for ind, query in grouped(searches):
             response = self.search(index=ind, body=query)
             took += response['took']
             responses.append(response)
@@ -684,16 +772,66 @@ class FakeElasticsearch(Elasticsearch):
         }
         return result
 
-    @query_params('_source', '_source_exclude', '_source_include',
-                  'allow_no_indices', 'analyze_wildcard', 'analyzer', 'default_operator',
-                  'df', 'expand_wildcards', 'explain', 'fielddata_fields', 'fields',
-                  'from_', 'ignore_unavailable', 'lenient', 'lowercase_expanded_terms',
-                  'preference', 'q', 'request_cache', 'routing', 'scroll', 'search_type',
-                  'size', 'sort', 'stats', 'suggest_field', 'suggest_mode',
-                  'suggest_size', 'suggest_text', 'terminate_after', 'timeout',
-                  'track_scores', 'version')
-    def search(self, index=None, doc_type=None, body=None, params=None, headers=None):
+    @_rewrite_parameters(
+        body_fields=(
+            "aggregations",
+            "aggs",
+            "collapse",
+            "docvalue_fields",
+            "explain",
+            "ext",
+            "fields",
+            "from_",
+            "highlight",
+            "indices_boost",
+            "knn",
+            "min_score",
+            "pit",
+            "post_filter",
+            "profile",
+            "query",
+            "rank",
+            "rescore",
+            "runtime_mappings",
+            "script_fields",
+            "search_after",
+            "seq_no_primary_term",
+            "size",
+            "slice",
+            "sort",
+            "source",
+            "stats",
+            "stored_fields",
+            "suggest",
+            "terminate_after",
+            "timeout",
+            "track_scores",
+            "track_total_hits",
+            "version",
+        ),
+        parameter_aliases={
+            "_source": "source",
+            "_source_excludes": "source_excludes",
+            "_source_includes": "source_includes",
+            "from": "from_",
+        },
+    )
+    @wrap_object_api_response
+    def search(
+        self,
+        *,
+        index: t.Optional[t.Union[str, t.Sequence[str]]] = None,
+        aggregations: t.Optional[t.Mapping[str, t.Mapping[str, t.Any]]] = None,
+        aggs: t.Optional[t.Mapping[str, t.Mapping[str, t.Any]]] = None,
+        from_: t.Optional[int] = None,
+        query: t.Optional[t.Mapping[str, t.Any]] = None,
+        scroll: t.Optional[t.Union["t.Literal[-1]", "t.Literal[0]", str]] = None,
+        size: t.Optional[int] = None,
+        body: t.Optional[t.Dict[str, t.Any]] = None,
+        **params
+    ) -> ObjectApiResponse[t.Any]:
         searchable_indexes = self._normalize_index_to_list(index)
+        body = body if body is not None else {}
 
         matches = []
         conditions = []
@@ -704,13 +842,7 @@ class FakeElasticsearch(Elasticsearch):
                 conditions.append(self._get_fake_query_condition(query_type_str, condition))
         for searchable_index in searchable_indexes:
 
-            for document in self.__documents_dict[searchable_index]:
-
-                if doc_type:
-                    if isinstance(doc_type, list) and document.get('_type') not in doc_type:
-                        continue
-                    if isinstance(doc_type, str) and document.get('_type') != doc_type:
-                        continue
+            for document in self._documents_dict[searchable_index]:
                 if conditions:
                     for condition in conditions:
                         if condition.evaluate(document):
@@ -744,10 +876,14 @@ class FakeElasticsearch(Elasticsearch):
             hits.append(match)
 
         # build aggregations
-        if body is not None and 'aggs' in body:
+        _aggregations = aggregations or aggs
+        if body:
+            _aggregations = body.get("aggregations", None) or body.get("aggs", None)
+
+        if _aggregations:
             aggregations = {}
 
-            for aggregation, definition in body['aggs'].items():
+            for aggregation, definition in _aggregations.items():
                 aggregations[aggregation] = {
                     "doc_count_error_upper_bound": 0,
                     "sum_other_doc_count": 0,
@@ -757,99 +893,95 @@ class FakeElasticsearch(Elasticsearch):
             if aggregations:
                 result['aggregations'] = aggregations
 
-        if 'scroll' in params:
+        _size = int(body.get("size", size or 10))
+        _from_ = int(body.get("from", from_ or 0))
+
+        if scroll is not None:
             result['_scroll_id'] = str(get_random_scroll_id())
-            params['size'] = int(params.get('size', 10))
-            params['from'] = int(params.get('from') + params.get('size') if 'from' in params else 0)
-            self.__scrolls[result.get('_scroll_id')] = {
+            params['size'] = _size
+            params['from'] = _from_ + _size if _from_ is not None else 0
+            self._scrolls[result.get('_scroll_id')] = {
                 'index': index,
-                'doc_type': doc_type,
+                'doc_type': "_doc",
                 'body': body,
                 'params': params
             }
-            hits = hits[params.get('from'):params.get('from') + params.get('size')]
-        elif 'size' in params:
-            hits = hits[:int(params['size'])]
-        elif body and 'size' in body:
-            hits = hits[:int(body['size'])]
+            hits = hits[_from_:_from_ + _size]
+        elif _size is not None:
+            hits = hits[:_size]
 
         result['hits']['hits'] = hits
 
         return result
 
-    @query_params('scroll')
-    def scroll(self, scroll_id, params=None, headers=None):
-        scroll = self.__scrolls.pop(scroll_id)
+    @_rewrite_parameters(
+        body_fields=("scroll_id", "scroll"),
+    )
+    @wrap_object_api_response
+    def scroll(
+        self,
+        *,
+        scroll_id: t.Optional[str] = None,
+        **params
+    ) -> ObjectApiResponse[t.Any]:
+        scroll = self._scrolls.pop(scroll_id, None)
+        if scroll is None:
+            raise NotFoundError(
+                message="Not Found",
+                meta=ApiResponseMeta(404, "HTTP/1.1", {}, 1, None),
+                body={
+                    "type": "search_phase_execution_exception",
+                    "reason": "all shards failed",
+                    "phase": "query",
+                    "grouped": True,
+                }
+            )
+
         result = self.search(
             index=scroll.get('index'),
-            doc_type=scroll.get('doc_type'),
-            body=scroll.get('body'),
-            params=scroll.get('params')
+            # body=scroll.get("body"),
+            scroll=scroll,
+            **scroll.get("params"),
         )
         return result
 
-    @query_params('consistency', 'parent', 'refresh', 'replication', 'routing',
-                  'timeout', 'version', 'version_type')
-    def delete(self, index, id, doc_type=None, params=None, headers=None):
-
+    @_rewrite_parameters()
+    @wrap_object_api_response
+    def delete(
+        self,
+        *,
+        index: str,
+        id: str,
+        **params
+    ) -> ObjectApiResponse[t.Any]:
         found = False
-        ignore = extract_ignore_as_iterable(params)
 
-        if index in self.__documents_dict:
-            for document in self.__documents_dict[index]:
+        if index in self._documents_dict:
+            for document in self._documents_dict[index]:
                 if document.get('_id') == id:
                     found = True
-                    if doc_type and document.get('_type') != doc_type:
-                        found = False
-                    if found:
-                        self.__documents_dict[index].remove(document)
-                        break
+                    self._documents_dict[index].remove(document)
+                    break
 
         result_dict = {
             'found': found,
             '_index': index,
-            '_type': doc_type,
+            '_type': "_doc",
             '_id': id,
             '_version': 1,
         }
 
         if found:
             return result_dict
-        elif params and 404 in ignore:
+        elif self._ignore_status is not DEFAULT and 404 in self._ignore_status:
             return {'found': False}
         else:
-            raise NotFoundError(404, json.dumps(result_dict))
-
-    @query_params('allow_no_indices', 'expand_wildcards', 'ignore_unavailable',
-                  'preference', 'routing')
-    def suggest(self, body, index=None, params=None, headers=None):
-        if index is not None and index not in self.__documents_dict:
-            raise NotFoundError(404, 'IndexMissingException[[{0}] missing]'.format(index))
-
-        result_dict = {}
-        for key, value in body.items():
-            text = value.get('text')
-            suggestion = int(text) + 1 if isinstance(text, int) else '{0}_suggestion'.format(text)
-            result_dict[key] = [
-                {
-                    'text': text,
-                    'length': 1,
-                    'options': [
-                        {
-                            'text': suggestion,
-                            'freq': 1,
-                            'score': 1.0
-                        }
-                    ],
-                    'offset': 0
-                }
-            ]
-        return result_dict
+            raise NotFoundError(message="Not Found", meta=ApiResponseMeta(404, "HTTP/1.1", {}, 1, None), body=result_dict)
 
     def _normalize_index_to_list(self, index):
         # Ensure to have a list of index
         if index is None:
-            searchable_indexes = self.__documents_dict.keys()
+            searchable_indexes = self._documents_dict.keys()
         elif isinstance(index, str) or isinstance(index, unicode):
             searchable_indexes = [index]
         elif isinstance(index, list):
@@ -860,8 +992,8 @@ class FakeElasticsearch(Elasticsearch):
 
         # Check index(es) exists
         for searchable_index in searchable_indexes:
-            if searchable_index not in self.__documents_dict:
-                raise NotFoundError(404, 'IndexMissingException[[{0}] missing]'.format(searchable_index))
+            if searchable_index not in self._documents_dict:
+                raise NotFoundError(message='IndexMissingException[[{0}] missing]'.format(searchable_index), meta=ApiResponseMeta(404, "HTTP/1.1", {}, 1, None), body={})
 
         return searchable_indexes
 

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
-
+import unittest
 from tests import TestElasticmock, DOC_TYPE
+import elasticsearch
 
 
 class TestCount(TestElasticmock):
@@ -31,6 +32,7 @@ class TestCount(TestElasticmock):
         count = self.es.count(doc_type=[])
         self.assertEqual(0, count.get('_shards').get('skipped'))
 
+    @unittest.skipIf(elasticsearch.__version__ > (8, 0), "Custom doc-types deprectated in ES 6, not supported in ES 8 or higher.")
     def test_should_count_with_doc_types(self):
         self.es.index(index='index', doc_type=DOC_TYPE, body={'data': 'test1'})
         self.es.index(index='index', doc_type='different-doc-type', body={'data': 'test2'})
