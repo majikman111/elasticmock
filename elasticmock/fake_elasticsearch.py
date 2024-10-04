@@ -595,12 +595,14 @@ class FakeElasticsearch(Elasticsearch):
     ) -> ObjectApiResponse[t.Any]:
         # Actually it only supports script equal operations
         # TODO: Full support from painless language
+        if body and script is None:
+            script = body['script']
         total_updated = 0
         if isinstance(index, list):
             index, = index
         new_values = {}
-        script_params = body['script']['params']
-        script_source = body['script']['source'] \
+        script_params = script['params']
+        script_source = script['source'] \
             .split(';')
         for sentence in script_source:
             if sentence:
